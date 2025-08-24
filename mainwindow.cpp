@@ -29,6 +29,9 @@
 #include <QHBoxLayout>
 #include <QSpinBox>
 #include <QClipboard>
+#include <QThread>
+#include <QMutex>
+#include <QQueue>
 #include <random>
 
 using namespace Qt::StringLiterals;
@@ -71,26 +74,33 @@ struct Pixel final {
     return qSqrt(qreal(dr * dr) + qreal(dg * dg) + qreal(db * db));
 }
 
-[[nodiscard]] static inline bool extractColorsFromImage(
-    QList<std::pair<QColor, qreal>>& resultOut,
-    QImage imageIn,
-    const qsizetype k = 5, // 4~8 is best, don't be too large (eg. > 20)! We want to get the most "attractive" color, if k is too large, the result would be distracted!
-    const qsizetype maxIterations = 50, // most of the time the iteration will stop at < 20.
-    const int maxWidth = 100, // if > 0, the image will be shrinked to not exceed this width. The image won't be changed if <= 0.
-    const int maxHeight = 100, // same as above, just related to height.
-    const int alphaThreshold = 180 // if > 0 and < 255, only the pixels whose alpha >= this value are accepted.
-) {
+struct ColorItem final {
+    QColor color{};
+    qreal ratio{ 0 };
+};
+using ColorItemList = QList<ColorItem>;
+
+struct UserOptions final {
+    QString filePath{}; // MUST be a local file path, not an URL.
+    qsizetype k{ 5 }; // 4~8 is best, don't be too large (eg. > 20)! We want to get the most "attractive" color, if k is too large, the result would be distracted!
+    qsizetype maxIterations{ 50 }; // Most of the time the iteration will stop at around 20 or so.
+    int maxWidth{ 100 }; // If > 0, the image size will be shrinked to not exceed this width. The image width won't be changed if this value <= 0.
+    int maxHeight{ 100 }; // Same as above, just only applied to height.
+    int alphaThreshold{ 180 }; // If > 0 and < 255, only the pixels whose alpha >= this value are accepted.
+};
+
+[[nodiscard]] static inline bool extractColorsFromImage(ColorItemList& resultOut, QImage imageIn, const UserOptions& options) {
     QElapsedTimer timer{};
     timer.start();
     if constexpr (IS_DEBUG_BUILD) {
         qInfo() << "------------------------------------------------------";
         qDebug() << "Checking whether there are any in-appropriate function parameters ...";
-        qDebug().nospace() << "k=" << k << ", maxIterations=" << maxIterations << ", maxWidth=" << maxWidth << ", maxHeight=" << maxHeight << ", alphaThreshold=" << alphaThreshold;
+        qDebug().nospace() << "k=" << options.k << ", maxIterations=" << options.maxIterations << ", maxWidth=" << options.maxWidth << ", maxHeight=" << options.maxHeight << ", alphaThreshold=" << options.alphaThreshold;
     }
     Q_ASSERT(!imageIn.isNull());
-    Q_ASSERT(k > 1);
-    Q_ASSERT(maxIterations > 0);
-    if (Q_UNLIKELY(imageIn.isNull() || k <= 1 || maxIterations <= 0)) {
+    Q_ASSERT(options.k > 1);
+    Q_ASSERT(options.maxIterations > 0);
+    if (Q_UNLIKELY(imageIn.isNull() || options.k <= 1 || options.maxIterations <= 0)) {
         qWarning() << "Function parameter not valid, algorithm forcely exited. Please try again with appropriate ones.";
         return false;
     }
@@ -101,14 +111,14 @@ struct Pixel final {
         qDebug() << "Checking whether we need to shrink the image size to speed up the whole process ...";
     }
     const qsizetype originalImageTotalPixelCount{ image.width() * image.height() };
-    if (Q_LIKELY(maxWidth > 0 || maxHeight > 0)) {
+    if (Q_LIKELY(options.maxWidth > 0 || options.maxHeight > 0)) {
         int targetWidth{ image.width() };
-        if (maxWidth > 0) {
-            targetWidth = qMin(targetWidth, maxWidth);
+        if (options.maxWidth > 0) {
+            targetWidth = qMin(targetWidth, options.maxWidth);
         }
         int targetHeight{ image.height() };
-        if (maxHeight > 0) {
-            targetHeight = qMin(targetHeight, maxHeight);
+        if (options.maxHeight > 0) {
+            targetHeight = qMin(targetHeight, options.maxHeight);
         }
         if (Q_LIKELY(targetWidth != image.width() || targetHeight != image.height())) {
             image = std::move(image.scaled(targetWidth, targetHeight, Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
@@ -131,7 +141,7 @@ struct Pixel final {
         for (int x{ 0 }; x < image.width(); ++x) {
             const QRgb rgba{ image.pixel(x, y) };
             const int a{ qAlpha(rgba) };
-            if (Q_LIKELY(alphaThreshold <= std::numeric_limits<quint8>::min() || alphaThreshold >= std::numeric_limits<quint8>::max() || a >= alphaThreshold)) {
+            if (Q_LIKELY(options.alphaThreshold <= std::numeric_limits<quint8>::min() || options.alphaThreshold >= std::numeric_limits<quint8>::max() || a >= options.alphaThreshold)) {
                 const auto r{ static_cast<quint8>(qRed(rgba)) };
                 const auto g{ static_cast<quint8>(qGreen(rgba)) };
                 const auto b{ static_cast<quint8>(qBlue(rgba)) };
@@ -160,8 +170,8 @@ struct Pixel final {
     if constexpr (IS_DEBUG_BUILD) {
         qDebug() << "Start building random centroid list ...";
     }
-    QList<Pixel> centroidList(k);
-    const auto& generateRandomCentroidList{ [k, totalValidPixelCount, &pixelList, &centroidList](){
+    QList<Pixel> centroidList(options.k);
+    const auto& generateRandomCentroidList{ [totalValidPixelCount, &pixelList, &centroidList, &options](){
         QList<qsizetype> indiceList(totalValidPixelCount);
         for (qsizetype index{ 0 }; index < indiceList.size(); ++index) {
             indiceList[index] = index;
@@ -171,7 +181,7 @@ struct Pixel final {
             std::mt19937_64 mt64(rd());
             std::shuffle(indiceList.begin(), indiceList.end(), mt64);
         }
-        for (qsizetype index{ 0 }; index < k && index < totalValidPixelCount; ++index) {
+        for (qsizetype index{ 0 }; index < options.k && index < totalValidPixelCount; ++index) {
             const auto randomIndex{ indiceList[index] };
             centroidList[index] = pixelList[randomIndex];
         }
@@ -181,7 +191,7 @@ struct Pixel final {
         qDebug() << "Random centroid list generated.";
         qDebug() << "Start building cluster list ...";
     }
-    QList<QList<Pixel>> clusterList(k);
+    QList<QList<Pixel>> clusterList(options.k);
     for (auto& cluster : clusterList) {
         cluster.reserve(totalValidPixelCount);
     }
@@ -197,7 +207,7 @@ struct Pixel final {
             qDebug() << "Start iterating.";
         }
         bool badClusterDetected{ false };
-        for (qsizetype iteration{ 0 }; iteration < maxIterations; ++iteration) {
+        for (qsizetype iteration{ 0 }; iteration < options.maxIterations; ++iteration) {
             if constexpr (IS_DEBUG_BUILD) {
                 qDebug() << "Current iteration:" << iteration + 1;
             }
@@ -207,7 +217,7 @@ struct Pixel final {
             for (const Pixel pixel : std::as_const(pixelList)) {
                 auto minimumDistance{ INVALID_COLOR_DISTANCE };
                 qsizetype closestIndex{ -1 };
-                for (qsizetype index{ 0 }; index < k; ++index) {
+                for (qsizetype index{ 0 }; index < options.k; ++index) {
                     const auto distance{ colorDistance(pixel, centroidList[index]) };
                     Q_ASSERT(qFuzzyIsNull(distance) || distance > qreal(0));
                     Q_ASSERT(distance < INVALID_COLOR_DISTANCE);
@@ -217,12 +227,12 @@ struct Pixel final {
                     }
                 }
                 Q_ASSERT(closestIndex >= 0);
-                Q_ASSERT(closestIndex < k);
+                Q_ASSERT(closestIndex < options.k);
                 clusterList[closestIndex].push_back(pixel);
             }
             bool changed{ false };
-            QList<Pixel> newCentroidList(k);
-            for (qsizetype index{ 0 }; index < k; ++index) {
+            QList<Pixel> newCentroidList(options.k);
+            for (qsizetype index{ 0 }; index < options.k; ++index) {
                 const auto& cluster{ clusterList[index] };
                 //Q_ASSERT(!cluster.isEmpty());
                 //Q_ASSERT(cluster.size() < totalValidPixelCount);
@@ -281,40 +291,41 @@ struct Pixel final {
     // No longer needed from now on and it may use much memory depending on the image and user options,
     // so release it's memory as soon as possible.
     pixelList = {};
-    QList<qsizetype> clusterSizeList(k);
-    for (qsizetype index{ 0 }; index < k; ++index) {
+    QList<qsizetype> clusterSizeList(options.k);
+    for (qsizetype index{ 0 }; index < options.k; ++index) {
         clusterSizeList[index] = clusterList[index].size();
     }
     // No longer needed from now on and it may use much memory depending on the image and user options,
     // so release it's memory as soon as possible.
     clusterList = {};
-    QList<qsizetype> clusterIndexList(k);
-    for (qsizetype index{ 0 }; index < k; ++index) {
+    QList<qsizetype> clusterIndexList(options.k);
+    for (qsizetype index{ 0 }; index < options.k; ++index) {
         clusterIndexList[index] = index;
     }
     std::sort(clusterIndexList.begin(), clusterIndexList.end(),
               [&clusterSizeList](qsizetype indexLHS, qsizetype indexRHS){
                   return clusterSizeList[indexLHS] < clusterSizeList[indexRHS];
               });
-    const auto& generateResultForIndex{ [k, totalValidPixelCount, &centroidList, &clusterSizeList](const qsizetype clusterIndex){
+    const auto& generateResultForIndex{ [totalValidPixelCount, &centroidList, &clusterSizeList, &options](const qsizetype clusterIndex){
         Q_ASSERT(clusterIndex >= 0);
-        Q_ASSERT(clusterIndex < k);
+        Q_ASSERT(clusterIndex < options.k);
         const Pixel pixel{ centroidList[clusterIndex] };
-        QColor color{ std::move(QColor::fromRgb(static_cast<int>(pixel.r), static_cast<int>(pixel.g), static_cast<int>(pixel.b))) };
+        ColorItem result{};
+        result.color = std::move(QColor::fromRgb(static_cast<int>(pixel.r), static_cast<int>(pixel.g), static_cast<int>(pixel.b)));
         const qsizetype clusterSize{ clusterSizeList[clusterIndex] };
         Q_ASSERT(clusterSize > 0);
         Q_ASSERT(clusterSize < totalValidPixelCount);
-        const qreal ratio{ qreal(clusterSize) / qreal(totalValidPixelCount) };
-        return std::move(std::make_pair(std::move(color), ratio));
+        result.ratio = qreal(clusterSize) / qreal(totalValidPixelCount);
+        return std::move(result);
     } };
     if constexpr (IS_DEBUG_BUILD) {
         const qsizetype clusterIndex{ clusterIndexList.constLast() };
         const auto result{ generateResultForIndex(clusterIndex) };
-        qDebug().noquote().nospace() << "Re-ordering done. The most dominant color is: " << std::move(result.first.name().toUpper()) << ", ratio: " << result.second * qreal(100) << "%";
+        qDebug().noquote().nospace() << "Re-ordering done. The most dominant color is: " << std::move(result.color.name().toUpper()) << ", ratio: " << result.ratio * qreal(100) << "%";
         qDebug() << "Start generating result ...";
     }
-    resultOut.resize(k);
-    for (qsizetype index{ 0 }; index < k; ++index) {
+    resultOut.resize(options.k);
+    for (qsizetype index{ 0 }; index < options.k; ++index) {
         const qsizetype clusterIndex{ clusterIndexList[index] };
         auto result{ generateResultForIndex(clusterIndex) };
         resultOut[index] = std::move(result);
@@ -425,13 +436,26 @@ struct Pixel final {
     return angleDeg > startAngleDeg && angleDeg < endAngleDeg;
 }
 
-struct UserOptions final {
-    QString filePath{};
-    qsizetype k{ 5 };
-    qsizetype maxIterations{ 50 };
-    int maxWidth{ 100 };
-    int maxHeight{ 100 };
-    int alphaThreshold{ 180 };
+class WorkerThread final : public QThread {
+    Q_OBJECT
+
+public:
+    explicit WorkerThread(QObject* parent = nullptr);
+    ~WorkerThread() override;
+
+public Q_SLOTS:
+    void addTask(const UserOptions& options);
+
+Q_SIGNALS:
+    void newResultReady(ColorItemList result);
+    void errorOccurred(QString message);
+
+protected:
+    void run() override;
+
+private:
+    QMutex m_taskMutex{};
+    QQueue<UserOptions> m_taskQueue{};
 };
 
 class OptionsDialog final : public QDialog {
@@ -441,8 +465,14 @@ public:
     explicit OptionsDialog(QWidget* parent = nullptr, Qt::WindowFlags f = {});
     ~OptionsDialog() override;
 
+    [[nodiscard]] UserOptions& userOptions();
     [[nodiscard]] const UserOptions& userOptions() const;
+
     [[nodiscard]] QSettings& settings();
+    [[nodiscard]] const QSettings& settings() const;
+
+protected:
+    void showEvent(QShowEvent* event) override;
 
 private:
     QLineEdit* m_filePathEdit{ nullptr };
@@ -466,18 +496,60 @@ public:
     MainWindowPrivate(MainWindow* qq);
     ~MainWindowPrivate();
 
-    [[nodiscard]] bool parseImage(QImage image);
-    [[nodiscard]] bool parseImage(QString filePath = {});
+    void parseImage();
     [[nodiscard]] QRectF pieRect() const;
     [[nodiscard]] QPixmap grabResultImage();
 
     MainWindow* q_ptr{ nullptr };
     qsizetype highlightedSliceIndex{ -1 };
-    QList<std::pair<QColor, qreal>> colorList{};
-    QString imageFilePath{};
+    ColorItemList colorList{};
     bool isGrabbing{ false };
     OptionsDialog* optionsDialog{ nullptr };
+    WorkerThread workerThread{};
+    QString alternativeImageFilePath{};
 };
+
+WorkerThread::WorkerThread(QObject* parent) : QThread{ parent } {
+    setObjectName(u"WorkerThread"_s);
+}
+
+WorkerThread::~WorkerThread() = default;
+
+void WorkerThread::addTask(const UserOptions& options) {
+    const QMutexLocker locker(&m_taskMutex);
+    m_taskQueue.enqueue(options);
+}
+
+void WorkerThread::run() {
+    while (true) {
+        if (isInterruptionRequested()) { // Respect Qt's own facility.
+            return;
+        }
+        UserOptions options{};
+        {
+            QMutexLocker locker(&m_taskMutex);
+            if (m_taskQueue.isEmpty()) {
+                locker.unlock();
+                msleep(10);
+                continue;
+            }
+            options = std::move(m_taskQueue.dequeue());
+        }
+        QImage image{ options.filePath };
+        if (image.isNull()) {
+            Q_EMIT errorOccurred(std::move(tr("The selected image file cannot be loaded successfully!")));
+            msleep(10);
+            continue;
+        }
+        ColorItemList result{};
+        result.reserve(options.k);
+        if (extractColorsFromImage(result, std::move(image), options)) {
+            Q_EMIT newResultReady(std::move(result));
+        } else {
+            Q_EMIT errorOccurred(std::move(tr("Failed to analyze image color!")));
+        }
+    }
+}
 
 OptionsDialog::OptionsDialog(QWidget* parent, Qt::WindowFlags f) : QDialog{ parent, f } {
     setAttribute(Qt::WA_DontCreateNativeAncestors);
@@ -593,6 +665,10 @@ OptionsDialog::OptionsDialog(QWidget* parent, Qt::WindowFlags f) : QDialog{ pare
 
 OptionsDialog::~OptionsDialog() = default;
 
+UserOptions& OptionsDialog::userOptions() {
+    return m_options;
+}
+
 const UserOptions& OptionsDialog::userOptions() const {
     return m_options;
 }
@@ -601,43 +677,52 @@ QSettings& OptionsDialog::settings() {
     return m_settings;
 }
 
+const QSettings& OptionsDialog::settings() const {
+    return m_settings;
+}
+
+void OptionsDialog::showEvent(QShowEvent* event) {
+    QDialog::showEvent(event);
+    if (!m_options.filePath.isEmpty()) {
+        m_filePathEdit->setText(QDir::toNativeSeparators(m_options.filePath));
+    }
+}
+
 MainWindowPrivate::MainWindowPrivate(MainWindow* qq) : q_ptr{ qq } {
     Q_ASSERT(q_ptr);
-    colorList.reserve(100);
     optionsDialog = new OptionsDialog(q_ptr);
+    MainWindow::connect(&workerThread, &WorkerThread::newResultReady, q_ptr, [this](ColorItemList result){
+        Q_ASSERT(!result.isEmpty());
+        colorList = std::move(result);
+        q_ptr->update();
+    });
+    MainWindow::connect(&workerThread, &WorkerThread::errorOccurred, q_ptr, [this](QString message){
+        Q_ASSERT(!message.isEmpty());
+        QMessageBox::critical(q_ptr, MainWindow::tr("ERROR"), message);
+    });
+    workerThread.start(WorkerThread::NormalPriority);
 }
 
-MainWindowPrivate::~MainWindowPrivate() = default;
-
-bool MainWindowPrivate::parseImage(QImage image) {
-    Q_Q(MainWindow);
-    if (image.isNull()) {
-        QMessageBox::critical(q, MainWindow::tr("ERROR"), MainWindow::tr("The selected image file cannot be loaded successfully!"));
-        return false;
+MainWindowPrivate::~MainWindowPrivate() {
+    if (workerThread.isRunning()) {
+        workerThread.requestInterruption();
+        workerThread.quit();
+        workerThread.wait();
     }
-    const UserOptions& options{ optionsDialog->userOptions() };
-    if (!extractColorsFromImage(colorList, std::move(image), options.k, options.maxIterations, options.maxWidth, options.maxHeight, options.alphaThreshold)) {
-        QMessageBox::critical(q, MainWindow::tr("ERROR"), MainWindow::tr("Failed to analyze image color!"));
-        return false;
-    }
-    imageFilePath.clear();
-    q->update();
-    return true;
 }
 
-bool MainWindowPrivate::parseImage(QString filePath) {
+void MainWindowPrivate::parseImage() {
     Q_Q(MainWindow);
-    if (filePath.isEmpty()) {
+    UserOptions& options{ optionsDialog->userOptions() };
+    if (!alternativeImageFilePath.isEmpty()) {
+        options.filePath = std::move(std::exchange(alternativeImageFilePath, QString{}));
+    }
+    if (options.filePath.isEmpty()) {
         QMessageBox::critical(q, MainWindow::tr("ERROR"), MainWindow::tr("The image file path MUST not be empty!"));
-        return false;
+        return;
     }
-    qDebug() << "Trying to process:" << std::move(QDir::toNativeSeparators(filePath));
-    QImage image{ filePath };
-    if (!parseImage(std::move(image))) {
-        return false;
-    }
-    imageFilePath = std::move(filePath);
-    return true;
+    qDebug() << "Trying to process:" << std::move(QDir::toNativeSeparators(options.filePath));
+    workerThread.addTask(std::move(options));
 }
 
 QRectF MainWindowPrivate::pieRect() const {
@@ -683,7 +768,7 @@ MainWindow::MainWindow(QWidget* parent) : QWidget{ parent }, d_ptr{ std::make_un
             if (result == OptionsDialog::Rejected) {
                 return;
             }
-            std::ignore = d->parseImage(d->optionsDialog->userOptions().filePath);
+            d->parseImage();
         });
     }
 
@@ -693,9 +778,7 @@ MainWindow::MainWindow(QWidget* parent) : QWidget{ parent }, d_ptr{ std::make_un
     });
     new QShortcut(QKeySequence::Refresh, this, this, [this](){
         Q_D(MainWindow);
-        if (!d->imageFilePath.isEmpty()) {
-            std::ignore = d->parseImage(d->imageFilePath);
-        }
+        d->parseImage();
     });
     new QShortcut(QKeySequence::Save, this, this, [this](){
         Q_D(MainWindow);
@@ -790,9 +873,9 @@ void MainWindow::mouseMoveEvent(QMouseEvent *event) {
         qreal currentAngle{ 90 }; // 0 degree is +x direction, positive degree is counter-wise.
         for (qsizetype index{ 0 }; index < d->colorList.size(); ++index) {
             const auto& slice{ d->colorList[index] };
-            Q_ASSERT(slice.second > qreal(0));
-            Q_ASSERT(slice.second < qreal(1));
-            const qreal spanAngle{ slice.second * qreal(360) };
+            Q_ASSERT(slice.ratio > qreal(0));
+            Q_ASSERT(slice.ratio < qreal(1));
+            const qreal spanAngle{ slice.ratio * qreal(360) };
             const qreal startAngleDeg{ currentAngle };
             const qreal endAngleDeg{ currentAngle + spanAngle };
             if (isPointInPieSlice(mousePos, pieCenter, pieRadius, startAngleDeg, endAngleDeg)) {
@@ -836,17 +919,15 @@ void MainWindow::paintEvent(QPaintEvent*) {
     qreal currentAngle{ 90 }; // 0 degree is +x direction, positive degree is counter-wise.
     for (qsizetype index{ 0 }; index < d->colorList.size(); ++index) {
         const auto& slice{ d->colorList[index] };
-        Q_ASSERT(slice.second > qreal(0));
-        Q_ASSERT(slice.second < qreal(1));
-        const QColor& color{ slice.first };
-        Q_ASSERT(color.isValid());
-        Q_ASSERT(color.alpha() == 255);
-        const qreal ratio{ slice.second };
-        const bool lightColor{ isColorLight(color) };
+        Q_ASSERT(slice.ratio > qreal(0));
+        Q_ASSERT(slice.ratio < qreal(1));
+        Q_ASSERT(slice.color.isValid());
+        Q_ASSERT(slice.color.alpha() == 255);
+        const bool lightColor{ isColorLight(slice.color) };
         const bool highlightCurrentSlice{ hasHighlightedSlice && d->highlightedSliceIndex == index };
         QPen pen{};
         if (index == d->colorList.size() - 1) {
-            const QColor reversedColor{ std::move(QColor::fromRgb(255 - color.red(), 255 - color.green(), 255 - color.blue())) };
+            const QColor reversedColor{ std::move(QColor::fromRgb(255 - slice.color.red(), 255 - slice.color.green(), 255 - slice.color.blue())) };
             pen.setColor(highlightCurrentSlice ? (isColorLight(reversedColor) ? reversedColor.darker(130) : reversedColor.lighter(130)) : reversedColor);
             pen.setWidthF(qreal(10));
         } else {
@@ -854,8 +935,8 @@ void MainWindow::paintEvent(QPaintEvent*) {
             pen.setWidthF(qreal(1));
         }
         painter.setPen(pen);
-        painter.setBrush(highlightCurrentSlice ? (lightColor ? color.darker(130) : color.lighter(130)) : color);
-        const qreal spanAngle{ ratio * qreal(360) };
+        painter.setBrush(highlightCurrentSlice ? (lightColor ? slice.color.darker(130) : slice.color.lighter(130)) : slice.color);
+        const qreal spanAngle{ slice.ratio * qreal(360) };
         painter.drawPie(pieRect, currentAngle * qreal(16), spanAngle * qreal(16));
         const qreal middleAngleDeg{ currentAngle + spanAngle / qreal(2) };
         const qreal middleAngleRad{ qDegreesToRadians(middleAngleDeg) };
@@ -866,7 +947,7 @@ void MainWindow::paintEvent(QPaintEvent*) {
         textRect.setHeight(fm.height() * qreal(2)); // 2 lines: 1 line for the color hex text and another line for the ratio text.
         textRect.moveCenter(textCenterPos);
         painter.setPen(lightColor ? QColorConstants::Black : QColorConstants::White);
-        const QString sliceText{ u"%1\n%2%"_s.arg(color.name().toUpper(), QString::number(ratio * qreal(100))) };
+        const QString sliceText{ u"%1\n%2%"_s.arg(slice.color.name().toUpper(), QString::number(slice.ratio * qreal(100))) };
         painter.drawText(textRect, Qt::AlignCenter | Qt::TextDontClip, sliceText);
         currentAngle += spanAngle;
     }
@@ -889,11 +970,12 @@ void MainWindow::dropEvent(QDropEvent *event) {
     Q_ASSERT(hasData);
     Q_ASSERT(data.isValid());
     if (data.typeId() == QMetaType::QImage) {
-        QImage image{ std::move(qvariant_cast<QImage>(data)) };
-        std::ignore = d->parseImage(std::move(image));
+        const QImage image{ std::move(qvariant_cast<QImage>(data)) };
+        Q_UNUSED(image);
     } else {
         Q_ASSERT(data.typeId() == QMetaType::QString);
-        std::ignore = d->parseImage(std::move(data.toString()));
+        d->alternativeImageFilePath = std::move(data.toString());
+        d->parseImage();
     }
 }
 

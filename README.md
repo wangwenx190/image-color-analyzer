@@ -6,6 +6,8 @@ You can use this tool to find out which color is the most dominant color of a gi
 
 Please be advised that this tool is specifically designed to analyze images with a multitude of colors, where the dominant color cannot be directly determined by the naked eye. If you use it to examine images with solid colors or an exceptionally small number of colors (e.g., a total of no more than 10 colors), the tool will not function properly.
 
+Please be advised that this tool is only intended for rough data estimation and is not specifically designed for precise scientific calculations or analysis. Under no circumstances should this tool be used in serious academic settings or similar environments.
+
 ## Snapshots
 
 ![Main Window](./docs/mainwindow.png)
